@@ -6,340 +6,460 @@ import pandas as pd
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# ============================================================
-# SETTINGS
-# ============================================================
-
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-NSE_HOME = "https://www.nseindia.com"
-FNO_LOTS_URL = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
 
 IST = ZoneInfo("Asia/Kolkata")
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/140.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0",
     "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
 }
 
 
-# ============================================================
-# NSE SESSION
-# ============================================================
+def get_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
 
-def create_nse_session():
-    session = requests.Session()
-    session.headers.update(HEADERS)
 
-    r = session.get(NSE_HOME, timeout=20)
+def download_zip(session, url):
+    r = session.get(url, timeout=30)
     r.raise_for_status()
 
-    return session
-
-
-# ============================================================
-# CURRENT F&O UNIVERSE
-# ============================================================
-
-def get_current_fno_stocks(session):
-    """
-    NSE's current permitted-lot-size file contains eligible
-    equity-derivative scrips and indices.
-
-    We use it every time the scanner runs, so the F&O universe
-    automatically follows NSE changes.
-    """
-
-    r = session.get(FNO_LOTS_URL, timeout=20)
-    r.raise_for_status()
-
-    text = r.content.decode("utf-8-sig", errors="replace")
-
-    rows = []
-
-    for line in text.splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        parts = [x.strip() for x in line.split(",")]
-
-        if len(parts) < 3:
-            continue
-
-        symbol = parts[1].strip().upper()
-
-        # Skip header
-        if symbol in ("SYMBOL", "SYMBOLS", "CODE"):
-            continue
-
-        # We only want individual stock underlyings.
-        # Index symbols are excluded.
-        index_symbols = {
-            "NIFTY",
-            "BANKNIFTY",
-            "FINNIFTY",
-            "MIDCPNIFTY",
-            "NIFTYNXT50",
-        }
-
-        if symbol in index_symbols:
-            continue
-
-        # Keep normal NSE symbols.
-        if symbol and symbol.replace("&", "").replace("-", "").replace("_", "").isalnum():
-            rows.append(symbol)
-
-    stocks = sorted(set(rows))
-
-    if len(stocks) < 50:
+    if not r.content[:2] == b"PK":
         raise RuntimeError(
-            f"NSE F&O universe download looks abnormal. "
-            f"Only {len(stocks)} symbols found."
+            f"NSE did not return a ZIP file. HTTP {r.status_code}"
         )
 
-    return stocks
+    return zipfile.ZipFile(io.BytesIO(r.content))
 
 
-# ============================================================
-# NSE EQUITY DAILY DATA
-# ============================================================
-
-def get_equity_history(session, symbol):
+def get_latest_trading_date():
     """
-    NSE historical equity API.
-    Gets enough recent daily data to obtain the latest two
-    completed trading sessions.
+    Try today and the previous few calendar days.
+    This automatically handles weekends and NSE holidays.
     """
+    today = datetime.now(IST).date()
 
-    end_date = datetime.now(IST).date()
-    start_date = end_date - timedelta(days=12)
+    for days_back in range(0, 10):
+        d = today - timedelta(days=days_back)
 
-    url = (
-        "https://www.nseindia.com/api/historical/cm/equity"
-        f"?symbol={symbol}"
-        f"&from={start_date.strftime('%d-%m-%Y')}"
-        f"&to={end_date.strftime('%d-%m-%Y')}"
-    )
-
-    r = session.get(url, timeout=20)
-
-    if r.status_code != 200:
-        return None
-
-    data = r.json()
-
-    records = data.get("data", [])
-
-    if not records:
-        return None
-
-    rows = []
-
-    for item in records:
-        try:
-            rows.append(
-                {
-                    "date": pd.to_datetime(item["CH_TIMESTAMP"]),
-                    "open": float(item["CH_OPENING_PRICE"]),
-                    "high": float(item["CH_TRADE_HIGH_PRICE"]),
-                    "low": float(item["CH_TRADE_LOW_PRICE"]),
-                    "close": float(item["CH_CLOSING_PRICE"]),
-                }
-            )
-        except (KeyError, TypeError, ValueError):
+        # Saturday / Sunday
+        if d.weekday() >= 5:
             continue
 
-    if len(rows) < 2:
-        return None
+        # We use the existence of the CM UDiFF file
+        # to determine whether NSE had a trading report.
+        url = (
+            "https://nsearchives.nseindia.com/content/cm/"
+            f"BhavCopy_NSE_CM_0_0_0_{d.strftime('%Y%m%d')}_F_0000.csv.zip"
+        )
 
-    df = pd.DataFrame(rows)
-    df = df.sort_values("date").reset_index(drop=True)
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+
+            if r.status_code == 200 and r.content[:2] == b"PK":
+                return d, r.content
+
+        except Exception:
+            pass
+
+    raise RuntimeError("Could not find the latest NSE CM UDiFF bhavcopy.")
+
+
+def read_cm_bhavcopy(zip_bytes):
+    z = zipfile.ZipFile(io.BytesIO(zip_bytes))
+
+    csv_files = [
+        x for x in z.namelist()
+        if x.lower().endswith(".csv")
+    ]
+
+    if not csv_files:
+        raise RuntimeError("No CSV found inside NSE CM bhavcopy ZIP.")
+
+    with z.open(csv_files[0]) as f:
+        df = pd.read_csv(f)
+
+    df.columns = [str(c).strip().upper() for c in df.columns]
 
     return df
 
 
-# ============================================================
-# CAMARILLA
-# ============================================================
-
-def camarilla_h4(high, low, close):
-    return close + ((high - low) * 1.1 / 2)
-
-
-def camarilla_l4(high, low, close):
-    return close - ((high - low) * 1.1 / 2)
-
-
-# ============================================================
-# INSIDE CAM
-# ============================================================
-
-def is_inside_cam(df):
+def get_fno_universe(session):
     """
-    User's exact definition:
+    Download NSE's current F&O market-lot file.
 
-    Today's H4 <= Yesterday's H4
-    AND
-    Today's L4 >= Yesterday's L4
+    This is refreshed every time the scanner runs.
+    Therefore the stock universe is NOT permanently hard-coded.
     """
 
-    yesterday = df.iloc[-2]
-    today = df.iloc[-1]
-
-    yesterday_h4 = camarilla_h4(
-        yesterday["high"],
-        yesterday["low"],
-        yesterday["close"],
+    url = (
+        "https://nsearchives.nseindia.com/content/fo/"
+        "fo_mktlots.csv"
     )
 
-    yesterday_l4 = camarilla_l4(
-        yesterday["high"],
-        yesterday["low"],
-        yesterday["close"],
+    r = session.get(url, timeout=30)
+    r.raise_for_status()
+
+    text = r.content.decode("utf-8-sig", errors="replace")
+
+    # Read the CSV flexibly.
+    df = pd.read_csv(io.StringIO(text), header=None)
+
+    stocks = set()
+
+    for col in df.columns:
+        for value in df[col].astype(str):
+            symbol = value.strip().upper()
+
+            if not symbol:
+                continue
+
+            # Ignore obvious headers and non-symbol text.
+            if symbol in {
+                "SYMBOL",
+                "SYMBOLS",
+                "INDEX",
+                "UNDERLYING",
+                "NIFTY",
+                "BANKNIFTY",
+                "FINNIFTY",
+                "MIDCPNIFTY",
+                "NIFTYNXT50",
+            }:
+                continue
+
+            # Normal NSE symbols are generally short.
+            if (
+                1 <= len(symbol) <= 30
+                and " " not in symbol
+                and "," not in symbol
+                and "/" not in symbol
+            ):
+                # Avoid purely numeric values.
+                if not symbol.isdigit():
+                    stocks.add(symbol)
+
+    # The lot file may contain other fields.
+    # Keep only symbols that actually appear in the
+    # equity bhavcopy later.
+    return stocks
+
+
+def find_column(df, possible_names):
+    for name in possible_names:
+        if name in df.columns:
+            return name
+
+    return None
+
+
+def prepare_equity_data(df):
+    symbol_col = find_column(
+        df,
+        ["TckrSymb", "SYMBOL", "Symbol"]
     )
 
-    today_h4 = camarilla_h4(
-        today["high"],
-        today["low"],
-        today["close"],
+    open_col = find_column(
+        df,
+        ["OpnPric", "OPEN", "OPEN_PRICE"]
     )
 
-    today_l4 = camarilla_l4(
-        today["high"],
-        today["low"],
-        today["close"],
+    high_col = find_column(
+        df,
+        ["HghPric", "HIGH", "HIGH_PRICE"]
     )
 
-    inside = (
-        today_h4 <= yesterday_h4
-        and
-        today_l4 >= yesterday_l4
+    low_col = find_column(
+        df,
+        ["LwPric", "LOW", "LOW_PRICE"]
     )
 
-    return inside, {
-        "date": today["date"],
-        "today_h4": today_h4,
-        "today_l4": today_l4,
-        "yesterday_h4": yesterday_h4,
-        "yesterday_l4": yesterday_l4,
-    }
+    close_col = find_column(
+        df,
+        ["ClsPric", "CLOSE", "CLOSE_PRICE"]
+    )
+
+    series_col = find_column(
+        df,
+        ["SctySrs", "SERIES"]
+    )
+
+    if not all(
+        [symbol_col, open_col, high_col, low_col, close_col]
+    ):
+        raise RuntimeError(
+            "Could not identify OHLC columns in NSE UDiFF file.\n"
+            f"Columns found: {list(df.columns)}"
+        )
+
+    out = pd.DataFrame()
+
+    out["SYMBOL"] = (
+        df[symbol_col]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    out["OPEN"] = pd.to_numeric(
+        df[open_col], errors="coerce"
+    )
+
+    out["HIGH"] = pd.to_numeric(
+        df[high_col], errors="coerce"
+    )
+
+    out["LOW"] = pd.to_numeric(
+        df[low_col], errors="coerce"
+    )
+
+    out["CLOSE"] = pd.to_numeric(
+        df[close_col], errors="coerce"
+    )
+
+    if series_col:
+        out["SERIES"] = (
+            df[series_col]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+    else:
+        out["SERIES"] = ""
+
+    out = out.dropna(
+        subset=["OPEN", "HIGH", "LOW", "CLOSE"]
+    )
+
+    # Equity normal series.
+    out = out[
+        (out["SERIES"] == "") |
+        (out["SERIES"] == "EQ")
+    ]
+
+    return out
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+def camarilla(high, low, close):
+    h4 = close + ((high - low) * 1.1 / 2)
+    l4 = close - ((high - low) * 1.1 / 2)
+
+    return h4, l4
+
+
+def scan_inside_cam(today_df, yesterday_df, fno_symbols):
+
+    today = today_df[
+        today_df["SYMBOL"].isin(fno_symbols)
+    ].copy()
+
+    yesterday = yesterday_df[
+        yesterday_df["SYMBOL"].isin(fno_symbols)
+    ].copy()
+
+    today = today.set_index("SYMBOL")
+    yesterday = yesterday.set_index("SYMBOL")
+
+    common = sorted(
+        set(today.index) & set(yesterday.index)
+    )
+
+    results = []
+
+    for symbol in common:
+
+        t = today.loc[symbol]
+        y = yesterday.loc[symbol]
+
+        today_h4, today_l4 = camarilla(
+            t["HIGH"],
+            t["LOW"],
+            t["CLOSE"]
+        )
+
+        yesterday_h4, yesterday_l4 = camarilla(
+            y["HIGH"],
+            y["LOW"],
+            y["CLOSE"]
+        )
+
+        # YOUR EXACT INSIDE CAM CONDITION
+        if (
+            today_h4 <= yesterday_h4
+            and
+            today_l4 >= yesterday_l4
+        ):
+            results.append({
+                "symbol": symbol,
+                "today_h4": today_h4,
+                "today_l4": today_l4,
+                "yesterday_h4": yesterday_h4,
+                "yesterday_l4": yesterday_l4,
+            })
+
+    return results
+
 
 def send_telegram(message):
+
     url = (
         f"https://api.telegram.org/bot"
         f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-    }
+    response = requests.post(
+        url,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+        },
+        timeout=30,
+    )
 
-    r = requests.post(url, data=payload, timeout=20)
-    r.raise_for_status()
+    response.raise_for_status()
 
-
-# ============================================================
-# MAIN SCANNER
-# ============================================================
 
 def main():
 
-    session = create_nse_session()
+    print("Starting Inside Camarilla scanner...")
 
-    print("Getting current NSE F&O universe...")
+    session = get_session()
 
-    stocks = get_current_fno_stocks(session)
+    # --------------------------------------------------------
+    # 1. Find latest NSE trading day
+    # --------------------------------------------------------
 
-    print(f"Current F&O stocks found: {len(stocks)}")
+    latest_date, latest_zip = get_latest_trading_date()
 
-    inside_cam = []
+    print(
+        "Latest NSE trading date:",
+        latest_date
+    )
 
-    failed = 0
+    # --------------------------------------------------------
+    # 2. Download today's equity bhavcopy
+    # --------------------------------------------------------
 
-    for i, symbol in enumerate(stocks, start=1):
+    today_df_raw = read_cm_bhavcopy(latest_zip)
 
-        print(f"{i}/{len(stocks)}  {symbol}")
+    today_df = prepare_equity_data(today_df_raw)
+
+    # --------------------------------------------------------
+    # 3. Download previous trading day's bhavcopy
+    # --------------------------------------------------------
+
+    previous_zip = None
+
+    for days_back in range(1, 10):
+
+        d = latest_date - timedelta(days=days_back)
+
+        if d.weekday() >= 5:
+            continue
+
+        url = (
+            "https://nsearchives.nseindia.com/content/cm/"
+            f"BhavCopy_NSE_CM_0_0_0_{d.strftime('%Y%m%d')}_F_0000.csv.zip"
+        )
 
         try:
-            df = get_equity_history(session, symbol)
-
-            if df is None:
-                failed += 1
-                continue
-
-            result, levels = is_inside_cam(df)
-
-            if result:
-                inside_cam.append(
-                    (
-                        symbol,
-                        levels["today_h4"],
-                        levels["today_l4"],
-                        levels["yesterday_h4"],
-                        levels["yesterday_l4"],
-                    )
-                )
-
-        except Exception as e:
-            print(f"Error with {symbol}: {e}")
-            failed += 1
-
-    today = datetime.now(IST).strftime("%d-%b-%Y")
-
-    # ========================================================
-    # TELEGRAM MESSAGE
-    # ========================================================
-
-    if inside_cam:
-
-        message = f"INSIDE CAMARILLA\n{today}\n\n"
-
-        for item in inside_cam:
-            symbol = item[0]
-            today_h4 = item[1]
-            today_l4 = item[2]
-
-            message += (
-                f"{symbol}\n"
-                f"H4: {today_h4:.2f} | "
-                f"L4: {today_l4:.2f}\n\n"
+            r = session.get(
+                url,
+                timeout=30
             )
 
+            if (
+                r.status_code == 200
+                and r.content[:2] == b"PK"
+            ):
+                previous_zip = r.content
+                previous_date = d
+                break
+
+        except Exception:
+            pass
+
+    if previous_zip is None:
+        raise RuntimeError(
+            "Could not find previous NSE trading day's bhavcopy."
+        )
+
+    yesterday_df_raw = read_cm_bhavcopy(
+        previous_zip
+    )
+
+    yesterday_df = prepare_equity_data(
+        yesterday_df_raw
+    )
+
+    # --------------------------------------------------------
+    # 4. Get CURRENT F&O universe
+    # --------------------------------------------------------
+
+    fno_symbols = get_fno_universe(session)
+
+    print(
+        "Symbols in current F&O source:",
+        len(fno_symbols)
+    )
+
+    # --------------------------------------------------------
+    # 5. Scan
+    # --------------------------------------------------------
+
+    results = scan_inside_cam(
+        today_df,
+        yesterday_df,
+        fno_symbols
+    )
+
+    # --------------------------------------------------------
+    # 6. Telegram message
+    # --------------------------------------------------------
+
+    date_text = latest_date.strftime("%d-%b-%Y")
+
+    message = (
+        "INSIDE CAMARILLA\n"
+        f"{date_text}\n\n"
+    )
+
+    if results:
+
+        for item in results:
+
+            message += (
+                f"{item['symbol']}\n"
+                f"H4: {item['today_h4']:.2f} | "
+                f"L4: {item['today_l4']:.2f}\n"
+            )
+
+            message += "\n"
+
         message += (
-            f"Total: {len(inside_cam)}\n"
-            f"F&O universe scanned: {len(stocks)}"
+            f"Total: {len(results)}\n"
+            f"F&O universe checked: {len(fno_symbols)}"
         )
 
     else:
 
-        message = (
-            f"INSIDE CAMARILLA\n"
-            f"{today}\n\n"
-            f"No stocks found.\n\n"
-            f"F&O universe scanned: {len(stocks)}"
+        message += (
+            "No stocks found.\n\n"
+            f"F&O universe checked: {len(fno_symbols)}"
         )
 
     send_telegram(message)
 
-    print("\nDone.")
-    print(f"Inside Cam stocks: {len(inside_cam)}")
-    print(f"Failed/Unavailable: {failed}")
+    print("Scanner completed successfully.")
+    print(
+        "Inside Cam stocks:",
+        len(results)
+    )
 
 
 if __name__ == "__main__":
