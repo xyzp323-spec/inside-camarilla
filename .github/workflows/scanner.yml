@@ -3,7 +3,7 @@ name: Inside Camarilla Scanner
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 12 * * 1-5"
+    - cron: "00 12 * * 1-5"
 
 jobs:
   scan:
