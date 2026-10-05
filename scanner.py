@@ -6,11 +6,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
@@ -24,27 +19,14 @@ HEADERS = {
 }
 
 
-# ============================================================
-# NSE SESSION
-# ============================================================
-
 def get_session():
     session = requests.Session()
     session.headers.update(HEADERS)
     return session
 
 
-# ============================================================
-# DOWNLOAD NSE ZIP
-# ============================================================
-
 def download_zip(session, url):
-
-    response = session.get(
-        url,
-        timeout=30
-    )
-
+    response = session.get(url, timeout=30)
     response.raise_for_status()
 
     if response.content[:2] != b"PK":
@@ -58,21 +40,12 @@ def download_zip(session, url):
     )
 
 
-# ============================================================
-# FIND LATEST TRADING DAY
-# ============================================================
-
 def get_latest_trading_date():
-
     today = datetime.now(IST).date()
 
     for days_back in range(0, 10):
+        date = today - timedelta(days=days_back)
 
-        date = today - timedelta(
-            days=days_back
-        )
-
-        # Skip Saturday and Sunday
         if date.weekday() >= 5:
             continue
 
@@ -83,7 +56,6 @@ def get_latest_trading_date():
         )
 
         try:
-
             response = requests.get(
                 url,
                 headers=HEADERS,
@@ -104,12 +76,7 @@ def get_latest_trading_date():
     )
 
 
-# ============================================================
-# READ NSE BHAVCOPY
-# ============================================================
-
 def read_cm_bhavcopy(zip_bytes):
-
     zip_file = zipfile.ZipFile(
         io.BytesIO(zip_bytes)
     )
@@ -126,10 +93,8 @@ def read_cm_bhavcopy(zip_bytes):
         )
 
     with zip_file.open(csv_files[0]) as file:
-
         df = pd.read_csv(file)
 
-    # NSE UDiFF column names are uppercase
     df.columns = [
         str(column).strip().upper()
         for column in df.columns
@@ -138,11 +103,17 @@ def read_cm_bhavcopy(zip_bytes):
     return df
 
 
-# ============================================================
-# GET CURRENT F&O UNIVERSE
-# ============================================================
-
 def get_fno_universe(session):
+    """
+    Download NSE's official permitted market-lots file.
+
+    IMPORTANT:
+    Only the actual SYMBOL column is used.
+    We do NOT scan every column for strings.
+
+    This prevents names, dates, lot sizes, descriptions,
+    etc. from accidentally being counted as F&O symbols.
+    """
 
     print("Downloading current NSE F&O universe...")
 
@@ -163,73 +134,131 @@ def get_fno_universe(session):
         errors="replace"
     )
 
+    # First try normal CSV with headers.
     df = pd.read_csv(
-        io.StringIO(text),
-        header=None
+        io.StringIO(text)
+    )
+
+    df.columns = [
+        str(column).strip().upper()
+        for column in df.columns
+    ]
+
+    print(
+        "F&O file columns:",
+        list(df.columns)
+    )
+
+    # Find the actual symbol column.
+    symbol_col = None
+
+    possible_symbol_columns = [
+        "SYMBOL",
+        "SYMBOLS",
+        "TCKRSYMB",
+        "UNDERLYING",
+        "UNDERLYINGSYMBOL",
+        "SCRIP",
+        "SECURITY"
+    ]
+
+    for column in possible_symbol_columns:
+        if column in df.columns:
+            symbol_col = column
+            break
+
+    if symbol_col is None:
+        raise RuntimeError(
+            "Could not identify SYMBOL column in "
+            "NSE F&O market-lots file.\n"
+            f"Columns found: {list(df.columns)}"
+        )
+
+    print(
+        "Using NSE F&O symbol column:",
+        symbol_col
     )
 
     stocks = set()
 
-    for column in df.columns:
+    for value in df[symbol_col].astype(str):
 
-        for value in df[column].astype(str):
+        symbol = value.strip().upper()
 
-            symbol = value.strip().upper()
+        if not symbol:
+            continue
 
-            if not symbol:
-                continue
+        # Remove obvious index entries.
+        if symbol in {
+            "NIFTY",
+            "BANKNIFTY",
+            "FINNIFTY",
+            "MIDCPNIFTY",
+            "NIFTYNXT50",
+            "NIFTYIT",
+            "NIFTYPHARMA",
+            "NIFTYAUTO",
+            "NIFTYMETAL",
+            "NIFTYREALTY",
+            "NIFTYFMCG",
+            "NIFTYENERGY",
+            "NIFTYINFRA",
+            "NIFTYCOMMODITIES",
+            "NIFTYCONSUMPTION",
+            "NIFTYCPSE",
+            "NIFTY500",
+            "NIFTY100",
+            "NIFTY200",
+            "NIFTYTOTALMARKET",
+        }:
+            continue
 
-            if symbol in {
-                "SYMBOL",
-                "SYMBOLS",
-                "INDEX",
-                "UNDERLYING",
-                "NIFTY",
-                "BANKNIFTY",
-                "FINNIFTY",
-                "MIDCPNIFTY",
-                "NIFTYNXT50",
-            }:
-                continue
+        # Ignore obvious header text.
+        if symbol in {
+            "SYMBOL",
+            "SYMBOLS",
+            "UNDERLYING",
+            "SECURITY",
+            "SCRIP"
+        }:
+            continue
 
-            if (
-                1 <= len(symbol) <= 30
-                and " " not in symbol
-                and "," not in symbol
-                and "/" not in symbol
-                and not symbol.isdigit()
-            ):
-                stocks.add(symbol)
+        # Basic sanity check.
+        if (
+            1 <= len(symbol) <= 30
+            and " " not in symbol
+            and "," not in symbol
+            and "/" not in symbol
+            and "\\" not in symbol
+            and not symbol.isdigit()
+        ):
+            stocks.add(symbol)
 
     print(
-        "Symbols found in F&O source:",
+        "Official NSE F&O stock symbols found:",
         len(stocks)
     )
+
+    if len(stocks) < 150:
+        raise RuntimeError(
+            "F&O universe looks suspiciously small: "
+            f"{len(stocks)} symbols found."
+        )
 
     return stocks
 
 
-# ============================================================
-# FIND COLUMN
-# ============================================================
-
 def find_column(df, possible_names):
 
     for name in possible_names:
-
         if name in df.columns:
             return name
 
     return None
 
 
-# ============================================================
-# PREPARE EQUITY DATA
-# ============================================================
-
 def prepare_equity_data(df):
 
-    # Current NSE UDiFF names
     symbol_col = find_column(
         df,
         [
@@ -296,7 +325,6 @@ def prepare_equity_data(df):
         low_col,
         close_col
     ]):
-
         raise RuntimeError(
             "Could not identify OHLC columns in "
             "NSE UDiFF file.\n"
@@ -333,16 +361,13 @@ def prepare_equity_data(df):
     )
 
     if series_col:
-
         output["SERIES"] = (
             df[series_col]
             .astype(str)
             .str.strip()
             .str.upper()
         )
-
     else:
-
         output["SERIES"] = ""
 
     output = output.dropna(
@@ -354,7 +379,6 @@ def prepare_equity_data(df):
         ]
     )
 
-    # Keep normal equity series
     output = output[
         (output["SERIES"] == "") |
         (output["SERIES"] == "EQ")
@@ -362,10 +386,6 @@ def prepare_equity_data(df):
 
     return output
 
-
-# ============================================================
-# CAMARILLA
-# ============================================================
 
 def camarilla(high, low, close):
 
@@ -379,10 +399,6 @@ def camarilla(high, low, close):
 
     return h4, l4
 
-
-# ============================================================
-# SCAN INSIDE CAM
-# ============================================================
 
 def scan_inside_cam(
     today_df,
@@ -430,11 +446,6 @@ def scan_inside_cam(
             yesterday_row["CLOSE"]
         )
 
-        # EXACT INSIDE CAM CONDITION
-        #
-        # Today's H4 <= Yesterday's H4
-        # Today's L4 >= Yesterday's L4
-
         if (
             today_h4 <= yesterday_h4
             and
@@ -451,10 +462,6 @@ def scan_inside_cam(
 
     return results
 
-
-# ============================================================
-# SEND TELEGRAM
-# ============================================================
 
 def send_telegram(message):
 
@@ -475,10 +482,6 @@ def send_telegram(message):
     response.raise_for_status()
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
 
     print(
@@ -486,10 +489,6 @@ def main():
     )
 
     session = get_session()
-
-    # --------------------------------------------------------
-    # 1. FIND LATEST TRADING DAY
-    # --------------------------------------------------------
 
     latest_date, latest_zip = (
         get_latest_trading_date()
@@ -499,10 +498,6 @@ def main():
         "Latest NSE trading date:",
         latest_date
     )
-
-    # --------------------------------------------------------
-    # 2. READ TODAY'S EQUITY DATA
-    # --------------------------------------------------------
 
     today_df_raw = read_cm_bhavcopy(
         latest_zip
@@ -516,10 +511,6 @@ def main():
         "Today's equity records:",
         len(today_df)
     )
-
-    # --------------------------------------------------------
-    # 3. FIND PREVIOUS TRADING DAY
-    # --------------------------------------------------------
 
     previous_zip = None
     previous_date = None
@@ -553,7 +544,6 @@ def main():
 
                 previous_zip = response.content
                 previous_date = date
-
                 break
 
         except Exception:
@@ -571,10 +561,6 @@ def main():
         previous_date
     )
 
-    # --------------------------------------------------------
-    # 4. READ PREVIOUS DAY
-    # --------------------------------------------------------
-
     yesterday_df_raw = read_cm_bhavcopy(
         previous_zip
     )
@@ -588,27 +574,15 @@ def main():
         len(yesterday_df)
     )
 
-    # --------------------------------------------------------
-    # 5. CURRENT F&O UNIVERSE
-    # --------------------------------------------------------
-
     fno_symbols = get_fno_universe(
         session
     )
-
-    # --------------------------------------------------------
-    # 6. SCAN
-    # --------------------------------------------------------
 
     results = scan_inside_cam(
         today_df,
         yesterday_df,
         fno_symbols
     )
-
-    # --------------------------------------------------------
-    # 7. TELEGRAM MESSAGE
-    # --------------------------------------------------------
 
     date_text = latest_date.strftime(
         "%d-%b-%Y"
@@ -643,10 +617,6 @@ def main():
             f"{len(fno_symbols)}"
         )
 
-    # --------------------------------------------------------
-    # 8. SEND TELEGRAM
-    # --------------------------------------------------------
-
     send_telegram(message)
 
     print(
@@ -659,10 +629,5 @@ def main():
     )
 
 
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
-
     main()
